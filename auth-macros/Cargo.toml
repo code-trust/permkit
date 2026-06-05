@@ -1,0 +1,20 @@
+[package]
+description = "Attribute macro for permission checks on async handlers"
+edition = "2024"
+license = "MIT"
+name = "permkit-auth-macros"
+repository = "https://github.com/code-trust/permkit"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+proc-macro2 = "1"

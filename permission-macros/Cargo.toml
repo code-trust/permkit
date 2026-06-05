@@ -1,0 +1,22 @@
+[package]
+description = "Derive macro for typed permission enums"
+edition = "2024"
+license = "MIT"
+name = "permkit-permission-macros"
+repository = "https://github.com/code-trust/permkit"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+utoipa = []
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }
