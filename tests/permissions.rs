@@ -1,4 +1,5 @@
 use futures::executor::block_on;
+use itertools::Itertools as _;
 use permkit::{
     EffectivePermissions,
     HasPermission,
@@ -17,6 +18,12 @@ enum CompanyPermission {
     List,
     #[permission(name = "Companies.Delete", roles = ["owner"])]
     Delete,
+}
+
+#[derive(Permission)]
+enum CompanyActionPermission {
+    #[permission(name = "update:companies")]
+    UpdateCompanies,
 }
 
 struct Context {
@@ -40,6 +47,7 @@ async fn guarded(context: Context) -> Result<(), PermissionCheckError> {
 #[test]
 fn inventory_collects_derived_permissions() {
     let _ = CompanyPermission::Delete;
+    let _ = CompanyActionPermission::UpdateCompanies;
 
     let entries = all_permissions();
     let mut company_permissions: Vec<_> = entries
@@ -57,6 +65,15 @@ fn inventory_collects_derived_permissions() {
             ("Companies.List", &["owner", "operator"][..]),
         ]
     );
+
+    let action_permissions: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.enum_name == "CompanyActionPermission")
+        .map(|entry| entry.name.as_ref())
+        .sorted()
+        .collect();
+
+    assert_eq!(action_permissions, vec!["update:*", "update:companies"]);
 }
 
 #[test]
