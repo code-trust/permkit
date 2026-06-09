@@ -33,20 +33,40 @@ pub struct PermissionEntry {
 
 inventory::collect!(PermissionEntry);
 
+struct PermissionKey {
+    prefix: String,
+    suffix: String,
+    separator: char,
+}
+
+impl PermissionKey {
+    fn parse(permission: &str) -> Option<Self> {
+        permission
+            .char_indices()
+            .find(|(_, separator)| matches!(separator, '.' | ':'))
+            .map(|(index, separator)| Self {
+                prefix: permission[..index].to_owned(),
+                suffix: permission[index + separator.len_utf8()..].to_owned(),
+                separator,
+            })
+    }
+}
+
 /// Iterate over every registered permission.
 ///
 /// Entries are yielded in linker order, which is not guaranteed stable. Sort the
-/// result if deterministic output matters. For every `Domain.Action` permission,
-/// this also adds a synthetic `Domain.*` wildcard entry without role grants.
+/// result if deterministic output matters. For every two-part permission name,
+/// this also adds a synthetic `<prefix><separator>*` wildcard entry without
+/// role grants.
 pub fn all_permissions() -> Vec<PermissionEntry> {
     let all: Vec<PermissionEntry> = inventory::iter::<PermissionEntry>().cloned().collect();
 
     let wildcards: Vec<PermissionEntry> = all
         .iter()
         .filter_map(|entry| {
-            let (prefix, _) = entry.name.split_once('.')?;
+            let parts = PermissionKey::parse(entry.name.as_ref())?;
             Some(PermissionEntry {
-                name: Cow::Owned(format!("{prefix}.*")),
+                name: Cow::Owned(format!("{}{}*", parts.prefix, parts.separator)),
                 enum_name: entry.enum_name,
                 roles: &[],
             })
@@ -170,16 +190,20 @@ pub fn permission_pattern_matches(pattern: &str, concrete: &str) -> bool {
         return true;
     }
 
-    let Some((module, action)) = concrete.split_once('.') else {
+    let Some(concrete) = PermissionKey::parse(concrete) else {
         return false;
     };
 
-    match pattern.split_once('.') {
-        None => false,
-        Some(("*", a)) => action == a,
-        Some((m, "*")) => module == m,
-        Some((m, a)) => m == module && a == action,
-    }
+    let Some(pattern) = PermissionKey::parse(pattern) else {
+        return false;
+    };
+
+    pattern.separator == concrete.separator
+        && match (pattern.prefix.as_str(), pattern.suffix.as_str()) {
+            ("*", suffix) => suffix == concrete.suffix,
+            (prefix, "*") => prefix == concrete.prefix,
+            (prefix, suffix) => prefix == concrete.prefix && suffix == concrete.suffix,
+        }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +301,16 @@ mod tests {
             "Companies.List"
         ));
         assert!(!permission_pattern_matches("Products.*", "Companies.List"));
+        assert!(permission_pattern_matches("update:*", "update:companies"));
+        assert!(permission_pattern_matches(
+            "*:companies",
+            "update:companies"
+        ));
+        assert!(permission_pattern_matches(
+            "update:companies",
+            "update:companies"
+        ));
+        assert!(!permission_pattern_matches("update:*", "Companies.List"));
     }
 
     #[test]

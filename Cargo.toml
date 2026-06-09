@@ -6,7 +6,7 @@ keywords = ["permissions", "authorization", "auth", "proc-macro"]
 license = "MIT"
 name = "permkit"
 repository = "https://github.com/code-trust/permkit"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace]
 members = ["auth-macros", "permission-macros"]
