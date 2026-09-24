@@ -6,7 +6,7 @@ keywords = ["permissions", "authorization", "auth", "proc-macro"]
 license = "MIT"
 name = "permkit"
 repository = "https://github.com/code-trust/permkit"
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace]
 members = ["auth-macros", "permission-macros"]
@@ -74,10 +74,10 @@ utoipa = ["dep:utoipa", "permission-macros?/utoipa"]
 [dependencies]
 auth-macros = { package = "permkit-auth-macros", version = "0.1.0", path = "auth-macros", optional = true }
 inventory = "0.3"
-itertools = "0.14"
+itertools = "0.15"
 permission-macros = { package = "permkit-permission-macros", version = "0.1.0", path = "permission-macros", optional = true }
 serde = "1"
-utoipa = { version = "5", optional = true }
+utoipa = { version = "6", optional = true }
 
 [dev-dependencies]
 futures = "0.3"
