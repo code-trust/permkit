@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 
 [dev-dependencies]
 proc-macro2 = "1"
