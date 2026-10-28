@@ -1,8 +1,12 @@
 //! Derive macro for permission enums.
 //!
-//! Annotate a unit-only enum with `#[derive(Permission)]` and use the
+//! Annotate an enum with `#[derive(Permission)]` and use the
 //! `#[permission(...)]` helper attribute to declare the permission string for
 //! each variant and the roles that should hold it by default.
+//!
+//! A variant may have one field: the resource the permission is checked
+//! against. Mark it with `#[permission(resource = "kind")]`; the field's
+//! `Display` output is the resource id.
 //!
 //! ```ignore
 //! use permkit::Permission;
@@ -14,6 +18,8 @@
 //!     List,
 //!     #[permission(name = "Companies.Create", roles = ["owner"])]
 //!     Create,
+//!     #[permission(name = "Companies.Update")]
+//!     Update(#[permission(resource = "company")] CompanyId),
 //! }
 //! ```
 
@@ -53,6 +59,12 @@ struct VariantInfo {
     ident: syn::Ident,
     name: String,
     roles: Vec<String>,
+    resource: Option<ResourceField>,
+}
+
+struct ResourceField {
+    member: syn::Member,
+    kind: String,
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -71,13 +83,6 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let mut seen_names = HashMap::<String, proc_macro2::Span>::new();
 
     for variant in &data.variants {
-        if !matches!(variant.fields, Fields::Unit) {
-            return Err(syn::Error::new(
-                variant.span(),
-                "Permission only supports unit variants (no fields)",
-            ));
-        }
-
         let info = parse_variant_info(variant, &enum_attrs)?;
 
         if let Some(prev_span) = seen_names.insert(info.name.clone(), variant.span()) {
@@ -102,7 +107,19 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let as_ref_arms = variants.iter().map(|variant| {
         let ident = &variant.ident;
         let name = &variant.name;
-        quote! { Self::#ident => #name }
+        quote! { Self::#ident { .. } => #name }
+    });
+
+    let resource_arms = variants.iter().map(|variant| {
+        let ident = &variant.ident;
+        match &variant.resource {
+            None => quote! { Self::#ident { .. } => ::core::option::Option::None },
+            Some(ResourceField { member, kind }) => quote! {
+                Self::#ident { #member: __resource } => ::core::option::Option::Some(
+                    ::permkit::Resource::new(#kind, __resource)
+                )
+            },
+        }
     });
 
     let enum_name_str = enum_ident.to_string();
@@ -141,12 +158,18 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .map(|variant| {
             let name = &variant.name;
             let roles = variant.roles.iter();
+            let resource = if let Some(ResourceField { kind, .. }) = &variant.resource {
+                quote! { ::core::option::Option::Some(#kind) }
+            } else {
+                quote! { ::core::option::Option::None }
+            };
             quote! {
                 ::permkit::inventory::submit! {
                     ::permkit::PermissionEntry {
                         name: ::std::borrow::Cow::Borrowed(#name),
                         enum_name: #enum_name_str,
                         roles: &[#(#roles),*],
+                        resource: #resource,
                     }
                 }
             }
@@ -159,6 +182,14 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             fn as_ref(&self) -> &str {
                 match self {
                     #(#as_ref_arms),*
+                }
+            }
+        }
+
+        impl #impl_generics ::permkit::Permission for #enum_ident #ty_generics #where_clause {
+            fn resource(&self) -> ::core::option::Option<::permkit::Resource> {
+                match self {
+                    #(#resource_arms),*
                 }
             }
         }
@@ -191,6 +222,8 @@ fn parse_enum_attrs(attrs: &[Attribute]) -> syn::Result<EnumAttrs> {
                 let expr: Expr = meta.value()?.parse()?;
                 out.default_roles = parse_string_array(&expr)?;
                 Ok(())
+            } else if meta.path.is_ident("resource") {
+                Err(meta.error("`resource = \"..\"` belongs on a variant's field"))
             } else {
                 Err(meta.error(
                     "unsupported `#[permission(...)]` key on enum (expected `roles = [..]`)",
@@ -216,12 +249,15 @@ fn parse_variant_info(variant: &Variant, enum_attrs: &EnumAttrs) -> syn::Result<
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
                 let lit: LitStr = meta.value()?.parse()?;
+                validate_name(&lit)?;
                 name = Some(lit.value());
                 Ok(())
             } else if meta.path.is_ident("roles") {
                 let expr: Expr = meta.value()?.parse()?;
                 roles = Some(parse_string_array(&expr)?);
                 Ok(())
+            } else if meta.path.is_ident("resource") {
+                Err(meta.error("`resource = \"..\"` belongs on the variant's field"))
             } else {
                 Err(meta.error(
                     "unsupported `#[permission(...)]` key on variant (expected `name = \"..\"` or `roles = [..]`)",
@@ -247,7 +283,79 @@ fn parse_variant_info(variant: &Variant, enum_attrs: &EnumAttrs) -> syn::Result<
         ident: variant.ident.clone(),
         name,
         roles,
+        resource: parse_resource_field(&variant.fields)?,
     })
+}
+
+/// Patterns split at the first separator, so `A.B.*` couldn't match `A.B.C`.
+fn validate_name(lit: &LitStr) -> syn::Result<()> {
+    let name = lit.value();
+    if name.contains('*') {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "permission name cannot contain `*`",
+        ));
+    }
+    if name.matches(['.', ':']).count() > 1 {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "permission name can have at most one `.` or `:` separator",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_resource_field(fields: &Fields) -> syn::Result<Option<ResourceField>> {
+    let mut iter = fields.iter();
+    let Some(field) = iter.next() else {
+        return Ok(None);
+    };
+    if let Some(extra) = iter.next() {
+        return Err(syn::Error::new(
+            extra.span(),
+            "a permission variant has at most one field, its resource",
+        ));
+    }
+
+    let mut kind: Option<String> = None;
+    for attr in &field.attrs {
+        if !attr.path().is_ident("permission") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("resource") {
+                return Err(meta.error(
+                    "unsupported `#[permission(...)]` key on field (expected `resource = \"..\"`)",
+                ));
+            }
+            if kind.is_some() {
+                return Err(meta.error("duplicate `resource = \"..\"`"));
+            }
+            let lit: LitStr = meta.value()?.parse()?;
+            if lit.value().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    "resource kind cannot be empty",
+                ));
+            }
+            kind = Some(lit.value());
+            Ok(())
+        })?;
+    }
+
+    let Some(kind) = kind else {
+        return Err(syn::Error::new(
+            field.span(),
+            "a permission field is its resource; mark it with `#[permission(resource = \"kind\")]`",
+        ));
+    };
+
+    let member = match &field.ident {
+        Some(ident) => syn::Member::Named(ident.clone()),
+        None => syn::Member::Unnamed(syn::Index::from(0)),
+    };
+
+    Ok(Some(ResourceField { member, kind }))
 }
 
 fn parse_string_array(expr: &Expr) -> syn::Result<Vec<String>> {
@@ -300,8 +408,8 @@ mod tests {
 
         let expanded = expand_ok(input);
 
-        assert!(expanded.contains("Self :: List => \"Companies.List\""));
-        assert!(expanded.contains("Self :: Create => \"Companies.Create\""));
+        assert!(expanded.contains("Self :: List { .. } => \"Companies.List\""));
+        assert!(expanded.contains("Self :: Create { .. } => \"Companies.Create\""));
         assert!(expanded.contains("roles : & [\"owner\" , \"operator\"]"));
         assert!(expanded.contains("roles : & [\"owner\"]"));
         assert_eq!(
@@ -314,6 +422,127 @@ mod tests {
         assert!(expanded.contains(":: permkit :: PermissionEntry"));
         assert!(expanded.contains("Cow :: Borrowed (\"Companies.List\")"));
         assert!(expanded.contains("enum_name : \"CompanyPermission\""));
+        assert!(expanded.contains("resource : :: core :: option :: Option :: None"));
+        assert!(expanded.contains(":: permkit :: Permission for CompanyPermission"));
+    }
+
+    #[test]
+    fn expands_resource_fields() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "Users.List")]
+                List(#[permission(resource = "company")] CompanyId),
+                #[permission(name = "Users.Remove")]
+                Remove {
+                    #[permission(resource = "customer")]
+                    customer_id: CustomerId,
+                },
+            }
+        };
+
+        let expanded = expand_ok(input);
+
+        assert!(expanded.contains("Self :: List { .. } => \"Users.List\""));
+        assert!(expanded.contains(
+            "Self :: List { 0 : __resource } => :: core :: option :: Option :: Some (:: permkit :: Resource :: new (\"company\" , __resource))"
+        ));
+        assert!(expanded.contains("Self :: Remove { customer_id : __resource }"));
+        assert!(expanded.contains("resource : :: core :: option :: Option :: Some (\"company\")"));
+        assert!(expanded.contains("resource : :: core :: option :: Option :: Some (\"customer\")"));
+    }
+
+    #[test]
+    fn rejects_more_than_one_field() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "Users.Remove")]
+                Remove {
+                    #[permission(resource = "customer")]
+                    customer_id: CustomerId,
+                    #[permission(resource = "company")]
+                    company_id: CompanyId,
+                },
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("at most one field"));
+    }
+
+    #[test]
+    fn rejects_fields_without_resource_kind() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "A.B")]
+                Variant(String),
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("#[permission(resource"));
+    }
+
+    #[test]
+    fn rejects_resource_on_variant() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "A.B", resource = "company")]
+                Variant,
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("belongs on the variant's field"));
+    }
+
+    #[test]
+    fn rejects_resource_on_enum() {
+        let input = quote! {
+            #[permission(resource = "company")]
+            pub enum P {
+                #[permission(name = "A.B")]
+                Variant,
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("belongs on a variant's field"));
+    }
+
+    #[test]
+    fn rejects_unknown_keys_on_field() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "A.B")]
+                Variant(#[permission(name = "A.C")] CompanyId),
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("key on field"));
+    }
+
+    #[test]
+    fn rejects_duplicate_resource() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "A.B")]
+                Variant(
+                    #[permission(resource = "company")]
+                    #[permission(resource = "customer")]
+                    CompanyId
+                ),
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("duplicate `resource"));
+    }
+
+    #[test]
+    fn rejects_empty_resource_kind() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "A.B")]
+                Variant(#[permission(resource = "")] CompanyId),
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("cannot be empty"));
     }
 
     #[test]
@@ -353,18 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_unit_variants() {
-        let input = quote! {
-            pub enum P {
-                #[permission(name = "A.B")]
-                Variant(String),
-            }
-        };
-        let err = try_expand(input).expect_err("should fail");
-        assert!(err.to_string().contains("unit variants"));
-    }
-
-    #[test]
     fn rejects_missing_name() {
         let input = quote! {
             pub enum P {
@@ -387,6 +604,30 @@ mod tests {
         };
         let err = try_expand(input).expect_err("should fail");
         assert!(err.to_string().contains("duplicate permission name"));
+    }
+
+    #[test]
+    fn rejects_wildcard_names() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "Users.*")]
+                X,
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("cannot contain `*`"));
+    }
+
+    #[test]
+    fn rejects_names_with_several_separators() {
+        let input = quote! {
+            pub enum P {
+                #[permission(name = "Users.Admin:Delete")]
+                X,
+            }
+        };
+        let err = try_expand(input).expect_err("should fail");
+        assert!(err.to_string().contains("at most one"));
     }
 
     #[test]

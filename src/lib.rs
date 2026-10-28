@@ -6,8 +6,13 @@
 //! permission expressions.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
+use std::fmt::Display;
 use std::future::Future;
+use std::sync::OnceLock;
 
 #[cfg(feature = "macros")]
 pub use auth_macros::permissions;
@@ -29,6 +34,7 @@ pub struct PermissionEntry {
     pub name: Cow<'static, str>,
     pub enum_name: &'static str,
     pub roles: &'static [&'static str],
+    pub resource: Option<&'static str>,
 }
 
 inventory::collect!(PermissionEntry);
@@ -69,6 +75,7 @@ pub fn all_permissions() -> Vec<PermissionEntry> {
                 name: Cow::Owned(format!("{}{}*", parts.prefix, parts.separator)),
                 enum_name: entry.enum_name,
                 roles: &[],
+                resource: None,
             })
         })
         .unique_by(|entry| entry.name.clone())
@@ -84,6 +91,70 @@ pub fn all_permission_names() -> Vec<Cow<'static, str>> {
         .sorted()
         .dedup()
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidGrant {
+    /// The pattern matches no registered permission.
+    UnknownPermission,
+    /// A matched permission takes another resource kind, or none.
+    ResourceKindMismatch {
+        permission: Cow<'static, str>,
+        expected: Option<&'static str>,
+    },
+}
+
+impl Display for InvalidGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPermission => write!(f, "grant pattern matches no registered permission"),
+            Self::ResourceKindMismatch {
+                permission,
+                expected: Some(kind),
+            } => write!(f, "{permission} is checked against a {kind} resource"),
+            Self::ResourceKindMismatch {
+                permission,
+                expected: None,
+            } => write!(f, "{permission} is checked without a resource"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidGrant {}
+
+fn validate_grant(
+    pattern: &str,
+    effect: PermissionEffect,
+    resource: Option<&Resource>,
+) -> Result<(), InvalidGrant> {
+    let matched: Vec<&PermissionEntry> = inventory::iter::<PermissionEntry>()
+        .filter(|entry| permission_pattern_matches(pattern, &entry.name))
+        .collect();
+
+    let Some(resource) = resource else {
+        return match (effect, matched.is_empty()) {
+            (PermissionEffect::Deny, true) => Err(InvalidGrant::UnknownPermission),
+            _ => Ok(()),
+        };
+    };
+
+    let on_kind = |entry: &&PermissionEntry| entry.resource == Some(resource.kind.as_ref());
+    let mismatch = |entry: &PermissionEntry| InvalidGrant::ResourceKindMismatch {
+        permission: entry.name.clone(),
+        expected: entry.resource,
+    };
+
+    match (effect, matched.first()) {
+        (_, None) => Err(InvalidGrant::UnknownPermission),
+        (PermissionEffect::Allow, Some(first)) if !matched.iter().any(on_kind) => {
+            Err(mismatch(first))
+        }
+        (PermissionEffect::Allow, Some(_)) => Ok(()),
+        (PermissionEffect::Deny, Some(_)) => match matched.iter().find(|entry| !on_kind(entry)) {
+            Some(entry) => Err(mismatch(entry)),
+            None => Ok(()),
+        },
+    }
 }
 
 /// Schema marker for a permission name string.
@@ -123,16 +194,170 @@ pub enum PermissionEffect {
     Deny,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Resource {
+    pub kind: Cow<'static, str>,
+    pub id: String,
+}
+
+impl Resource {
+    pub fn new(kind: impl Into<Cow<'static, str>>, id: impl Display) -> Self {
+        Self {
+            kind: kind.into(),
+            id: id.to_string(),
+        }
+    }
+}
+
+/// Implemented by `#[derive(Permission)]`.
+pub trait Permission: AsRef<str> {
+    fn resource(&self) -> Option<Resource>;
+}
+
+/// Construct with [`PermissionGrant::try_new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionGrant {
-    pub scope: String,
-    pub pattern: String,
-    pub effect: PermissionEffect,
+    scope: String,
+    pattern: String,
+    effect: PermissionEffect,
+    resource: Option<Resource>,
+}
+
+impl PermissionGrant {
+    /// `None` applies to every resource. A deny must match a registered
+    /// permission. On a resource, a deny must match only permissions of its
+    /// kind, an allow at least one.
+    pub fn try_new(
+        scope: impl Into<String>,
+        pattern: impl Into<String>,
+        effect: PermissionEffect,
+        resource: Option<Resource>,
+    ) -> Result<Self, InvalidGrant> {
+        let pattern = pattern.into();
+        validate_grant(&pattern, effect, resource.as_ref())?;
+        Ok(Self {
+            scope: scope.into(),
+            pattern,
+            effect,
+            resource,
+        })
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    pub fn effect(&self) -> PermissionEffect {
+        self.effect
+    }
+
+    pub fn resource(&self) -> Option<&Resource> {
+        self.resource.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceAccess {
+    All,
+    AllExcept(HashSet<String>),
+    Only(HashSet<String>),
+}
+
+impl ResourceAccess {
+    pub fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::AllExcept(ids) => !ids.contains(id),
+            Self::Only(ids) => ids.contains(id),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Only(ids) if ids.is_empty())
+    }
+
+    fn all_except(ids: HashSet<String>) -> Self {
+        if ids.is_empty() {
+            Self::All
+        } else {
+            Self::AllExcept(ids)
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::AllExcept(mut denied), Self::AllExcept(other)) => {
+                denied.retain(|id| other.contains(id));
+                Self::all_except(denied)
+            }
+            (Self::AllExcept(mut denied), Self::Only(allowed))
+            | (Self::Only(allowed), Self::AllExcept(mut denied)) => {
+                denied.retain(|id| !allowed.contains(id));
+                Self::all_except(denied)
+            }
+            (Self::Only(mut allowed), Self::Only(other)) => {
+                allowed.extend(other);
+                Self::Only(allowed)
+            }
+        }
+    }
+}
+
+/// Deny wins within a scope; any scope that allows passes.
+#[derive(Debug, Clone, Default)]
+pub struct EffectivePermissions {
+    scopes: HashMap<String, Scope>,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct EffectivePermissions {
-    scopes: HashMap<String, Vec<ScopedPermission>>,
+struct Scope {
+    grants: Vec<ScopedPermission>,
+    resources: HashMap<Resource, Vec<ScopedPermission>>,
+}
+
+impl Scope {
+    fn denies(&self, permission_key: &str) -> bool {
+        grants_match(&self.grants, PermissionEffect::Deny, permission_key)
+    }
+
+    /// Expects `resource`, if any, to be of the permission's kind.
+    fn allows(&self, permission_key: &str, resource: Option<&Resource>) -> bool {
+        let mut grants = std::iter::once(&self.grants)
+            .chain(resource.and_then(|resource| self.resources.get(resource)));
+        !grants
+            .clone()
+            .any(|grants| grants_match(grants, PermissionEffect::Deny, permission_key))
+            && grants.any(|grants| grants_match(grants, PermissionEffect::Allow, permission_key))
+    }
+
+    fn resource_access(&self, permission_key: &str, kind: &str) -> ResourceAccess {
+        if self.denies(permission_key) {
+            return ResourceAccess::Only(HashSet::new());
+        }
+
+        let ids = |matches: fn(&[ScopedPermission], &str) -> bool| {
+            self.resources
+                .iter()
+                .filter(|(resource, grants)| {
+                    resource.kind == kind && matches(grants, permission_key)
+                })
+                .map(|(resource, _)| resource.id.clone())
+                .collect()
+        };
+
+        if grants_match(&self.grants, PermissionEffect::Allow, permission_key) {
+            ResourceAccess::all_except(ids(|grants, permission_key| {
+                grants_match(grants, PermissionEffect::Deny, permission_key)
+            }))
+        } else {
+            ResourceAccess::Only(ids(allows_in_scope))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,46 +372,155 @@ impl EffectivePermissions {
     }
 
     pub fn from_grants(grants: impl IntoIterator<Item = PermissionGrant>) -> Self {
-        let scopes = grants
-            .into_iter()
-            .map(|grant| {
-                (
-                    grant.scope,
-                    ScopedPermission {
-                        pattern: grant.pattern,
-                        effect: grant.effect,
-                    },
-                )
-            })
-            .into_group_map();
+        let mut scopes = HashMap::<String, Scope>::new();
+        for grant in grants {
+            let scope = scopes.entry(grant.scope).or_default();
+            let permission = ScopedPermission {
+                pattern: grant.pattern,
+                effect: grant.effect,
+            };
+            match grant.resource {
+                None => scope.grants.push(permission),
+                Some(resource) => scope
+                    .resources
+                    .entry(resource)
+                    .or_default()
+                    .push(permission),
+            }
+        }
 
         Self { scopes }
     }
 
-    pub fn allows(&self, permission_key: &str) -> bool {
+    /// `resource` must be of the permission's registered kind, and `None` when
+    /// it has none; otherwise the check fails. Wildcard keys are never allowed.
+    pub fn allows(&self, permission_key: &str, resource: Option<&Resource>) -> bool {
+        is_concrete(permission_key)
+            && takes_resource(
+                permission_key,
+                resource.map(|resource| resource.kind.as_ref()),
+            )
+            && self.grants_allow(permission_key, resource)
+    }
+
+    fn grants_allow(&self, permission_key: &str, resource: Option<&Resource>) -> bool {
         self.scopes
             .values()
-            .any(|grants| allows_in_scope(grants, permission_key))
+            .any(|scope| scope.allows(permission_key, resource))
+    }
+
+    pub fn allows_permission(&self, permission: &impl Permission) -> bool {
+        self.allows(permission.as_ref(), permission.resource().as_ref())
+    }
+
+    pub fn resources(&self) -> HashSet<&Resource> {
+        self.scopes
+            .values()
+            .flat_map(|scope| scope.resources.keys())
+            .collect()
+    }
+
+    /// Allows, in `scope`, each concrete name on each resource both sides allow
+    /// it on.
+    pub fn intersect<'a>(
+        &self,
+        other: &Self,
+        permission_names: impl IntoIterator<Item = &'a str>,
+        scope: &str,
+    ) -> Self {
+        let resources: HashSet<&Resource> = self
+            .resources()
+            .into_iter()
+            .chain(other.resources())
+            .collect();
+
+        let mut grants = Vec::new();
+        for name in permission_names
+            .into_iter()
+            .filter(|name| is_concrete(name))
+        {
+            let both_allow = |on: Option<&Resource>| {
+                self.grants_allow(name, on) && other.grants_allow(name, on)
+            };
+            let grant = |effect, resource: Option<&Resource>| PermissionGrant {
+                scope: scope.to_owned(),
+                pattern: name.to_owned(),
+                effect,
+                resource: resource.cloned(),
+            };
+
+            // Resources without grants on either side get the result without one.
+            let everywhere = both_allow(None);
+            if everywhere {
+                grants.push(grant(PermissionEffect::Allow, None));
+            }
+            for &resource in resources
+                .iter()
+                .filter(|resource| takes_resource(name, Some(&resource.kind)))
+            {
+                match (everywhere, both_allow(Some(resource))) {
+                    (true, false) => grants.push(grant(PermissionEffect::Deny, Some(resource))),
+                    (false, true) => grants.push(grant(PermissionEffect::Allow, Some(resource))),
+                    _ => {}
+                }
+            }
+        }
+
+        Self::from_grants(grants)
+    }
+
+    /// The ids of `kind` the name is allowed on; no access unless `kind` is the
+    /// permission's registered kind. Wildcard keys get no access.
+    pub fn resource_access(&self, permission_key: &str, kind: &str) -> ResourceAccess {
+        if !is_concrete(permission_key) || !takes_resource(permission_key, Some(kind)) {
+            return ResourceAccess::Only(HashSet::new());
+        }
+
+        self.scopes
+            .values()
+            .map(|scope| scope.resource_access(permission_key, kind))
+            .fold(ResourceAccess::Only(HashSet::new()), ResourceAccess::union)
+    }
+}
+
+fn is_concrete(permission_key: &str) -> bool {
+    !permission_key.contains('*')
+}
+
+/// Whether the permission is checked against a resource of `kind`. Unregistered
+/// names take no resource.
+fn takes_resource(permission_key: &str, kind: Option<&str>) -> bool {
+    static KINDS: OnceLock<HashMap<&'static str, Vec<Option<&'static str>>>> = OnceLock::new();
+
+    let kinds = KINDS.get_or_init(|| {
+        inventory::iter::<PermissionEntry>()
+            .map(|entry| (entry.name.as_ref(), entry.resource))
+            .into_group_map()
+    });
+    match kinds.get(permission_key) {
+        Some(kinds) => kinds.contains(&kind),
+        None => kind.is_none(),
     }
 }
 
 fn allows_in_scope(grants: &[ScopedPermission], permission_key: &str) -> bool {
-    let denied = grants.iter().any(|permission| {
-        permission.effect == PermissionEffect::Deny
-            && permission_pattern_matches(&permission.pattern, permission_key)
-    });
-    if denied {
-        return false;
-    }
+    !grants_match(grants, PermissionEffect::Deny, permission_key)
+        && grants_match(grants, PermissionEffect::Allow, permission_key)
+}
 
+fn grants_match(
+    grants: &[ScopedPermission],
+    effect: PermissionEffect,
+    permission_key: &str,
+) -> bool {
     grants.iter().any(|permission| {
-        permission.effect == PermissionEffect::Allow
+        permission.effect == effect
             && permission_pattern_matches(&permission.pattern, permission_key)
     })
 }
 
 pub fn permission_pattern_matches(pattern: &str, concrete: &str) -> bool {
-    if pattern == "*" {
+    if pattern == "*" || pattern == concrete {
         return true;
     }
 
@@ -284,12 +618,50 @@ pub trait HasPermission<Context>: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::{
         EffectivePermissions,
         PermissionEffect,
+        PermissionEntry,
         PermissionGrant,
+        Resource,
+        ResourceAccess,
         permission_pattern_matches,
     };
+
+    macro_rules! company_permissions {
+        ($($name:literal),*) => {$(
+            inventory::submit! {
+                PermissionEntry {
+                    name: Cow::Borrowed($name),
+                    enum_name: "UserPermission",
+                    roles: &[],
+                    resource: Some("company"),
+                }
+            }
+        )*};
+    }
+
+    company_permissions!("Users.List", "Users.Create", "Users.Delete", "Users.Remove");
+
+    fn grant(
+        scope: &str,
+        pattern: &str,
+        effect: PermissionEffect,
+        resource: Option<Resource>,
+    ) -> PermissionGrant {
+        PermissionGrant {
+            scope: scope.to_owned(),
+            pattern: pattern.to_owned(),
+            effect,
+            resource,
+        }
+    }
+
+    fn company(id: &str) -> Resource {
+        Resource::new("company", id)
+    }
 
     #[test]
     fn matches_wildcard_patterns() {
@@ -314,21 +686,478 @@ mod tests {
     }
 
     #[test]
-    fn deny_wins_inside_scope() {
+    fn matches_names_without_separator_exactly() {
+        assert!(permission_pattern_matches("Audit", "Audit"));
+        assert!(permission_pattern_matches("*", "Audit"));
+        assert!(!permission_pattern_matches("Aud", "Audit"));
+        assert!(!permission_pattern_matches("Audit.*", "Audit"));
+        assert!(!permission_pattern_matches("*.Audit", "Audit"));
+
+        let permissions = EffectivePermissions::from_grants([grant(
+            "role",
+            "Audit",
+            PermissionEffect::Allow,
+            None,
+        )]);
+        assert!(permissions.allows("Audit", None));
+        assert!(!permissions.allows("Auditor", None));
+    }
+
+    #[test]
+    fn wildcard_keys_are_never_allowed() {
         let permissions = EffectivePermissions::from_grants([
-            PermissionGrant {
-                scope: "role".to_owned(),
-                pattern: "Companies.*".to_owned(),
-                effect: PermissionEffect::Allow,
-            },
-            PermissionGrant {
-                scope: "role".to_owned(),
-                pattern: "Companies.Delete".to_owned(),
-                effect: PermissionEffect::Deny,
-            },
+            grant("role", "*", PermissionEffect::Allow, None),
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant("role", "Users.Delete", PermissionEffect::Deny, None),
+            grant("role", "*", PermissionEffect::Allow, Some(company("a"))),
         ]);
 
-        assert!(permissions.allows("Companies.List"));
-        assert!(!permissions.allows("Companies.Delete"));
+        for key in ["*", "Users.*", "*.Delete"] {
+            assert!(!permissions.allows(key, None));
+            assert!(!permissions.allows(key, Some(&company("a"))));
+            assert_eq!(
+                permissions.resource_access(key, "company"),
+                ResourceAccess::Only([].into())
+            );
+        }
+        assert!(permissions.allows("Users.List", Some(&company("b"))));
+    }
+
+    #[test]
+    fn deny_wins_inside_scope() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Companies.*", PermissionEffect::Allow, None),
+            grant("role", "Companies.Delete", PermissionEffect::Deny, None),
+        ]);
+
+        assert!(permissions.allows("Companies.List", None));
+        assert!(!permissions.allows("Companies.Delete", None));
+    }
+
+    #[test]
+    fn resource_grants_apply_only_to_their_resource() {
+        let permissions = EffectivePermissions::from_grants([grant(
+            "role",
+            "Users.List",
+            PermissionEffect::Allow,
+            Some(company("a")),
+        )]);
+
+        assert!(permissions.allows("Users.List", Some(&company("a"))));
+        assert!(!permissions.allows("Users.List", Some(&company("b"))));
+        assert!(!permissions.resource_access("Users.List", "company").is_empty());
+    }
+
+    #[test]
+    fn grants_without_resource_apply_to_every_resource() {
+        let permissions = EffectivePermissions::from_grants([grant(
+            "role",
+            "Users.List",
+            PermissionEffect::Allow,
+            None,
+        )]);
+
+        assert!(permissions.allows("Users.List", Some(&company("a"))));
+        assert!(permissions.allows("Users.List", Some(&company("b"))));
+    }
+
+    #[test]
+    fn checks_need_the_permissions_resource_kind() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "*", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+
+        assert!(!permissions.allows("Users.Delete", None));
+        assert!(!permissions.allows("Users.Delete", Some(&Resource::new("customer", "a"))));
+        assert!(!permissions.allows("Admin.Run", Some(&company("a"))));
+        assert!(permissions.allows("Users.Delete", Some(&company("b"))));
+        assert!(permissions.allows("Admin.Run", None));
+        assert_eq!(
+            permissions.resource_access("Users.Delete", "customer"),
+            ResourceAccess::Only([].into())
+        );
+    }
+
+    #[test]
+    fn resource_grants_apply_only_to_permissions_of_their_kind() {
+        let permissions = EffectivePermissions::from_grants([grant(
+            "owner",
+            "*",
+            PermissionEffect::Allow,
+            Some(company("a")),
+        )]);
+
+        assert!(!permissions.allows("Admin.Run", None));
+        assert!(!permissions.allows("Admin.Run", Some(&company("a"))));
+        assert_eq!(
+            permissions.resource_access("Admin.Run", "company"),
+            ResourceAccess::Only([].into())
+        );
+        assert!(!permissions.resource_access("Users.List", "company").is_empty());
+        assert!(permissions.allows("Users.List", Some(&company("a"))));
+    }
+
+    #[test]
+    fn deny_on_resource_stays_on_that_resource() {
+        let permissions = EffectivePermissions::from_grants([
+            grant(
+                "role",
+                "Users.*",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant(
+                "role",
+                "Users.*",
+                PermissionEffect::Allow,
+                Some(company("b")),
+            ),
+            grant(
+                "role",
+                "Users.Remove",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+
+        assert!(!permissions.allows("Users.Remove", Some(&company("a"))));
+        assert!(permissions.allows("Users.Remove", Some(&company("b"))));
+    }
+
+    #[test]
+    fn deny_on_resource_wins_over_allow_without_resource() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+
+        assert!(!permissions.allows("Users.Delete", Some(&company("a"))));
+        assert!(permissions.allows("Users.Delete", Some(&company("b"))));
+        assert!(permissions.allows("Users.List", Some(&company("a"))));
+
+        let access = permissions.resource_access("Users.Delete", "company");
+        assert_eq!(access, ResourceAccess::AllExcept(["a".to_owned()].into()));
+        assert!(!access.contains("a"));
+        assert!(access.contains("b"));
+        assert_eq!(
+            permissions.resource_access("Users.List", "company"),
+            ResourceAccess::All
+        );
+    }
+
+    #[test]
+    fn deny_stays_in_its_scope() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+            grant(
+                "admin",
+                "Users.Delete",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+        ]);
+
+        assert!(permissions.allows("Users.Delete", Some(&company("a"))));
+        assert_eq!(
+            permissions.resource_access("Users.Delete", "company"),
+            ResourceAccess::All
+        );
+    }
+
+    #[test]
+    fn resource_access_combines_scopes() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Users.List", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("b")),
+            ),
+            grant("other", "Users.List", PermissionEffect::Allow, None),
+            grant(
+                "other",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("b")),
+            ),
+            grant(
+                "other",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("c")),
+            ),
+            grant(
+                "third",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(company("b")),
+            ),
+        ]);
+
+        assert_eq!(
+            permissions.resource_access("Users.List", "company"),
+            ResourceAccess::All
+        );
+
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Users.List", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Deny,
+                Some(company("b")),
+            ),
+            grant(
+                "other",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+        ]);
+
+        assert_eq!(
+            permissions.resource_access("Users.List", "company"),
+            ResourceAccess::AllExcept(["b".to_owned()].into())
+        );
+    }
+
+    #[test]
+    fn deny_without_resource_covers_resource_grants_in_its_scope() {
+        let permissions = EffectivePermissions::from_grants([
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant("role", "Users.Delete", PermissionEffect::Deny, None),
+            grant(
+                "role",
+                "Users.*",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant(
+                "other",
+                "Users.Delete",
+                PermissionEffect::Allow,
+                Some(company("b")),
+            ),
+        ]);
+
+        assert!(!permissions.allows("Users.Delete", Some(&company("a"))));
+        assert!(permissions.allows("Users.Delete", Some(&company("b"))));
+        assert!(permissions.allows("Users.List", Some(&company("a"))));
+        assert_eq!(
+            permissions.resource_access("Users.Delete", "company"),
+            ResourceAccess::Only(["b".to_owned()].into())
+        );
+    }
+
+    #[test]
+    fn resource_access_lists_allowed_resources() {
+        let permissions = EffectivePermissions::from_grants([
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(company("b")),
+            ),
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(Resource::new("customer", "x")),
+            ),
+        ]);
+
+        assert_eq!(
+            permissions.resource_access("Users.List", "company"),
+            ResourceAccess::Only(["a".to_owned(), "b".to_owned()].into())
+        );
+        assert_eq!(
+            permissions.resource_access("Users.Remove", "company"),
+            ResourceAccess::Only([].into())
+        );
+    }
+
+    #[test]
+    fn intersect_keeps_specific_denies_under_wildcard_allows() {
+        let account = EffectivePermissions::from_grants([
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant("role", "Users.Delete", PermissionEffect::Deny, None),
+            grant("role", "*", PermissionEffect::Allow, Some(company("a"))),
+            grant(
+                "role",
+                "Admin.Run",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+        let allowlist = EffectivePermissions::from_grants([grant(
+            "surface",
+            "*",
+            PermissionEffect::Allow,
+            None,
+        )]);
+
+        let clipped = account.intersect(
+            &allowlist,
+            [
+                "*",
+                "Users.*",
+                "*.Delete",
+                "Users.List",
+                "Users.Delete",
+                "Admin.*",
+                "Admin.Run",
+            ],
+            "clipped",
+        );
+
+        assert!(clipped.allows("Users.List", Some(&company("b"))));
+        assert!(!clipped.allows("Users.Delete", Some(&company("b"))));
+        assert!(!clipped.allows("Users.Delete", Some(&company("a"))));
+        assert!(!clipped.allows("Users.Create", Some(&company("b"))));
+        assert!(!clipped.allows("Admin.Run", None));
+    }
+
+    #[test]
+    fn intersect_keeps_resources() {
+        let account = EffectivePermissions::from_grants([
+            grant(
+                "role",
+                "Users.*",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant("tenant", "Messages.Send", PermissionEffect::Allow, None),
+            grant("tenant", "Admin.Run", PermissionEffect::Allow, None),
+        ]);
+        let allowlist = EffectivePermissions::from_grants([
+            grant("surface", "Users.*", PermissionEffect::Allow, None),
+            grant("surface", "Messages.*", PermissionEffect::Allow, None),
+        ]);
+
+        let clipped = account.intersect(
+            &allowlist,
+            ["Users.List", "Messages.Send", "Admin.Run"],
+            "clipped",
+        );
+
+        assert!(clipped.allows("Users.List", Some(&company("a"))));
+        assert!(!clipped.allows("Users.List", Some(&company("b"))));
+        assert!(clipped.allows("Messages.Send", None));
+        assert!(!clipped.allows("Admin.Run", None));
+    }
+
+    #[test]
+    fn intersect_keeps_denies_on_resources() {
+        let account = EffectivePermissions::from_grants([
+            grant("role", "Users.*", PermissionEffect::Allow, None),
+            grant(
+                "role",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+        let allowlist = EffectivePermissions::from_grants([
+            grant("surface", "*", PermissionEffect::Allow, None),
+            grant(
+                "surface",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("b")),
+            ),
+        ]);
+
+        let clipped = account.intersect(&allowlist, ["Users.Delete"], "clipped");
+
+        assert!(!clipped.allows("Users.Delete", Some(&company("a"))));
+        assert!(!clipped.allows("Users.Delete", Some(&company("b"))));
+        assert!(clipped.allows("Users.Delete", Some(&company("c"))));
+        assert_eq!(
+            clipped.resource_access("Users.Delete", "company"),
+            ResourceAccess::AllExcept(["a".to_owned(), "b".to_owned()].into())
+        );
+    }
+
+    #[test]
+    fn intersect_ignores_denies_in_scopes_that_never_allow() {
+        let account = EffectivePermissions::from_grants([
+            grant(
+                "role",
+                "Users.Delete",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant(
+                "blocked",
+                "Users.Delete",
+                PermissionEffect::Deny,
+                Some(company("a")),
+            ),
+        ]);
+        let allow_all = EffectivePermissions::from_grants([grant(
+            "surface",
+            "*",
+            PermissionEffect::Allow,
+            None,
+        )]);
+
+        let clipped = account.intersect(&allow_all, ["Users.Delete"], "clipped");
+
+        assert!(account.allows("Users.Delete", Some(&company("a"))));
+        assert!(clipped.allows("Users.Delete", Some(&company("a"))));
+        assert!(!clipped.allows("Users.Delete", Some(&company("b"))));
+    }
+
+    #[test]
+    fn resource_access_is_all_with_grant_without_resource() {
+        let permissions = EffectivePermissions::from_grants([
+            grant(
+                "role",
+                "Users.List",
+                PermissionEffect::Allow,
+                Some(company("a")),
+            ),
+            grant("tenant", "Users.*", PermissionEffect::Allow, None),
+        ]);
+
+        let access = permissions.resource_access("Users.List", "company");
+        assert_eq!(access, ResourceAccess::All);
+        assert!(access.contains("anything"));
     }
 }
