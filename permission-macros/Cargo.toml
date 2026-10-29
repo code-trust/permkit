@@ -4,7 +4,7 @@ edition = "2024"
 license = "MIT"
 name = "permkit-permission-macros"
 repository = "https://github.com/code-trust/permkit"
-version = "0.1.0"
+version = "0.2.0"
 
 [lib]
 proc-macro = true
